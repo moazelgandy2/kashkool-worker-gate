@@ -1,6 +1,18 @@
-name = "kashkool-video-gate"
+name = "kashkool-streaming-gate"
 main = "src/index.mjs"
 compatibility_date = "2026-02-20"
+
+[vars]
+CONTROL_PLANE_BASE_URL = "https://diligent-manatee-129.eu-west-1.convex.site"
+VIDEO_GATE_MAINTENANCE_MODE = "false"
+VIDEO_GATE_MANIFEST_PER_MINUTE = "60"
+VIDEO_GATE_PLAYLIST_PER_MINUTE = "120"
+VIDEO_GATE_SEGMENT_PER_MINUTE = "1600"
+VIDEO_GATE_KEY_PER_MINUTE = "30"
+VIDEO_GATE_KEY_REPLAY_TTL_SECONDS = "900"
+VIDEO_GATE_KEY_JTI_MAX_REUSE = "20"
+VIDEO_GATE_STRICT_REQUEST_CONTEXT = "true"
+VIDEO_GATE_ALLOWED_ORIGINS = "https://kashkool.online"
 
 [[r2_buckets]]
 binding = "VIDEO_DELIVERY_BUCKET"
@@ -8,4 +20,4 @@ bucket_name = "kashkool-delivery"
 
 [[kv_namespaces]]
 binding = "VIDEO_GATE_KV"
-id = "7e56e93e78f64a43b99e862fc9678a6e"
+id = "73f44a3c2762496d93e12e8a9378d4c1"
