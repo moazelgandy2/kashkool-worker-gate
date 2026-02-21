@@ -669,6 +669,169 @@ test("fails closed when control-plane validation request throws", async () => {
   }
 });
 
+test("auto-blocks session after key abuse and denies subsequent requests", async () => {
+  const payload = {
+    sid: "session_abuse_block",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "abuse_block_jti",
+    ua: base64UrlEncode("test-agent").slice(0, 32),
+    ip: "203.0.113",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const wrappedContentKey = wrapKey(Buffer.from("0123456789abcdef"), "key_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (String(url).includes("/video-playback-key")) {
+      return new Response(
+        JSON.stringify({ wrappedContentKey, contentKeyVersion: "v1" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv({
+      VIDEO_GATE_KEY_JTI_MAX_REUSE: "1",
+      VIDEO_GATE_ABUSE_AUTOBLOCK_ENABLED: "true",
+      VIDEO_GATE_ABUSE_BLOCK_TTL_SECONDS: "600",
+    });
+
+    const keyUrl = `https://gate.local/k/asset_1?kid=main&token=${encodeURIComponent(token)}`;
+
+    const first = await worker.fetch(
+      new Request(keyUrl, {
+        headers: {
+          "user-agent": "test-agent",
+          "cf-connecting-ip": "203.0.113.10",
+        },
+      }),
+      env,
+    );
+    assert.equal(first.status, 200);
+
+    const second = await worker.fetch(
+      new Request(keyUrl, {
+        headers: {
+          "user-agent": "test-agent",
+          "cf-connecting-ip": "203.0.113.10",
+        },
+      }),
+      env,
+    );
+    assert.equal(second.status, 429);
+
+    const manifest = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        {
+          headers: {
+            "user-agent": "test-agent",
+            "cf-connecting-ip": "203.0.113.10",
+          },
+        },
+      ),
+      env,
+    );
+    assert.equal(manifest.status, 403);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("auto-blocks abusive IP prefix and denies another session from same IP", async () => {
+  const payloadA = {
+    sid: "session_abuse_ip_a",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "abuse_ip_jti_a",
+    ua: base64UrlEncode("test-agent").slice(0, 32),
+    ip: "198.51.100",
+  };
+  const payloadB = {
+    sid: "session_abuse_ip_b",
+    uid: "user_2",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "abuse_ip_jti_b",
+    ua: base64UrlEncode("test-agent").slice(0, 32),
+    ip: "198.51.100",
+  };
+
+  const tokenA = makeToken(payloadA, "token_secret");
+  const tokenB = makeToken(payloadB, "token_secret");
+  const wrappedContentKey = wrapKey(Buffer.from("0123456789abcdef"), "key_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (String(url).includes("/video-playback-key")) {
+      return new Response(
+        JSON.stringify({ wrappedContentKey, contentKeyVersion: "v1" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv({
+      VIDEO_GATE_KEY_JTI_MAX_REUSE: "1",
+      VIDEO_GATE_ABUSE_AUTOBLOCK_ENABLED: "true",
+      VIDEO_GATE_ABUSE_IP_BLOCK_ENABLED: "true",
+      VIDEO_GATE_ABUSE_BLOCK_TTL_SECONDS: "600",
+    });
+
+    const keyUrlA = `https://gate.local/k/asset_1?kid=main&token=${encodeURIComponent(tokenA)}`;
+    const reqHeaders = {
+      "user-agent": "test-agent",
+      "cf-connecting-ip": "198.51.100.42",
+    };
+
+    const first = await worker.fetch(new Request(keyUrlA, { headers: reqHeaders }), env);
+    assert.equal(first.status, 200);
+
+    const second = await worker.fetch(new Request(keyUrlA, { headers: reqHeaders }), env);
+    assert.equal(second.status, 429);
+
+    const manifestB = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(tokenB)}`,
+        { headers: reqHeaders },
+      ),
+      env,
+    );
+    assert.equal(manifestB.status, 403);
+    const body = await manifestB.json();
+    assert.equal(body.detail, "ip_prefix_blocked_abuse");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("fails closed when validation config is missing", async () => {
   const payload = {
     sid: "session_missing_config",

@@ -3,6 +3,8 @@ const TEXT_DECODER = new TextDecoder();
 const inMemoryRateWindow = new Map();
 const inMemoryJtiWindow = new Map();
 const inMemorySessionValidationWindow = new Map();
+const inMemoryAbuseBlockWindow = new Map();
+const inMemoryAbuseIpBlockWindow = new Map();
 const SWEEP_INTERVAL = 250;
 let inMemorySweepCounter = 0;
 let hasLoggedPlaybackEventMissingConfig = false;
@@ -10,6 +12,7 @@ const CONTROL_PLANE_TIMEOUT_MS = 5_000;
 const CONTROL_PLANE_RETRY_DELAY_MS = 250;
 const CONTROL_PLANE_MAX_ATTEMPTS = 2;
 const DEFAULT_SESSION_VALIDATION_CACHE_TTL_SECONDS = 10;
+const DEFAULT_ABUSE_BLOCK_TTL_SECONDS = 10 * 60;
 
 const DEFAULT_RATE_CONFIG = {
   manifestPerMinute: 60,
@@ -35,6 +38,17 @@ function getAllowedOrigins(env) {
     .split(",")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+}
+
+function parseBoolean(raw, fallback) {
+  if (raw === undefined || raw === null || raw === "") {
+    return fallback;
+  }
+
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  return fallback;
 }
 
 function parseAllowedOriginRule(originValue) {
@@ -291,6 +305,21 @@ function getRateConfig(env) {
   };
 }
 
+function getAbuseAutoBlockEnabled(env) {
+  return parseBoolean(env.VIDEO_GATE_ABUSE_AUTOBLOCK_ENABLED, true);
+}
+
+function getAbuseIpBlockEnabled(env) {
+  return parseBoolean(env.VIDEO_GATE_ABUSE_IP_BLOCK_ENABLED, true);
+}
+
+function getAbuseBlockTtlSeconds(env) {
+  return parsePositiveInt(
+    env.VIDEO_GATE_ABUSE_BLOCK_TTL_SECONDS,
+    DEFAULT_ABUSE_BLOCK_TTL_SECONDS,
+  );
+}
+
 function getSessionValidationCacheTtlSeconds(env) {
   const parsed = parsePositiveInt(
     env.VIDEO_GATE_SESSION_VALIDATION_CACHE_TTL_SECONDS,
@@ -518,6 +547,10 @@ function getClientIp(request) {
   return fromHeader || undefined;
 }
 
+function getClientIpPrefix(request) {
+  return extractIpPrefix(getClientIp(request));
+}
+
 async function validateSessionWithControlPlane(env, tokenPayload, requestId) {
   const validationUrl = resolveControlPlaneEndpoint(
     env,
@@ -663,6 +696,8 @@ export function __resetForTests() {
   inMemoryRateWindow.clear();
   inMemoryJtiWindow.clear();
   inMemorySessionValidationWindow.clear();
+  inMemoryAbuseBlockWindow.clear();
+  inMemoryAbuseIpBlockWindow.clear();
   inMemorySweepCounter = 0;
   hasLoggedPlaybackEventMissingConfig = false;
 }
@@ -769,6 +804,74 @@ function sweepInMemoryWindows(now) {
   sweepExpiredEntries(inMemoryRateWindow, now);
   sweepExpiredEntries(inMemoryJtiWindow, now);
   sweepExpiredEntries(inMemorySessionValidationWindow, now);
+  sweepExpiredEntries(inMemoryAbuseBlockWindow, now);
+  sweepExpiredEntries(inMemoryAbuseIpBlockWindow, now);
+}
+
+async function blockSessionForAbuse(env, sessionId, ttlSeconds) {
+  const now = Date.now();
+  const expiresAt = now + ttlSeconds * 1000;
+  const key = `abuse:block:session:${sessionId}`;
+
+  if (env.VIDEO_GATE_KV) {
+    await env.VIDEO_GATE_KV.put(key, "1", {
+      expirationTtl: Math.max(60, ttlSeconds),
+    });
+    return;
+  }
+
+  inMemoryAbuseBlockWindow.set(key, { expiresAt, blocked: true });
+}
+
+async function blockIpPrefixForAbuse(env, ipPrefix, ttlSeconds) {
+  if (!ipPrefix) return;
+
+  const now = Date.now();
+  const expiresAt = now + ttlSeconds * 1000;
+  const key = `abuse:block:ip:${ipPrefix}`;
+
+  if (env.VIDEO_GATE_KV) {
+    await env.VIDEO_GATE_KV.put(key, "1", {
+      expirationTtl: Math.max(60, ttlSeconds),
+    });
+    return;
+  }
+
+  inMemoryAbuseIpBlockWindow.set(key, { expiresAt, blocked: true });
+}
+
+async function isSessionBlockedForAbuse(env, sessionId) {
+  const key = `abuse:block:session:${sessionId}`;
+  const now = Date.now();
+
+  if (env.VIDEO_GATE_KV) {
+    const blocked = await env.VIDEO_GATE_KV.get(key);
+    return blocked === "1";
+  }
+
+  const blocked = inMemoryAbuseBlockWindow.get(key);
+  if (!blocked || blocked.expiresAt <= now) {
+    return false;
+  }
+  return blocked.blocked === true;
+}
+
+async function isIpPrefixBlockedForAbuse(env, ipPrefix) {
+  if (!ipPrefix) return false;
+
+  const key = `abuse:block:ip:${ipPrefix}`;
+  const now = Date.now();
+
+  if (env.VIDEO_GATE_KV) {
+    const blocked = await env.VIDEO_GATE_KV.get(key);
+    return blocked === "1";
+  }
+
+  const blocked = inMemoryAbuseIpBlockWindow.get(key);
+  if (!blocked || blocked.expiresAt <= now) {
+    return false;
+  }
+  return blocked.blocked === true;
 }
 
 async function authorizeRequest(
@@ -807,6 +910,15 @@ async function authorizeRequest(
     parsed.payload.sid.length === 0
   ) {
     return { ok: false, status: 401, message: "Missing token session scope" };
+  }
+
+  const sessionBlocked = await isSessionBlockedForAbuse(env, parsed.payload.sid);
+  if (sessionBlocked) {
+    return {
+      ok: false,
+      status: 403,
+      message: "Session blocked due to abuse",
+    };
   }
 
   if (parsed.payload.assetId !== expectedAssetId) {
@@ -1091,6 +1203,10 @@ async function handleSegment(
 
 async function handleKeyRequest(request, env, executionCtx, assetId, requestId) {
   const startedAt = Date.now();
+  const abuseAutoBlockEnabled = getAbuseAutoBlockEnabled(env);
+  const abuseIpBlockEnabled = getAbuseIpBlockEnabled(env);
+  const abuseBlockTtlSeconds = getAbuseBlockTtlSeconds(env);
+  const ipPrefix = getClientIpPrefix(request);
   const rateConfig = getRateConfig(env);
   const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
   if (!auth.ok) return json({ error: auth.message }, auth.status);
@@ -1104,30 +1220,48 @@ async function handleKeyRequest(request, env, executionCtx, assetId, requestId) 
   );
   if (!allowed) {
     queuePlaybackEvent(executionCtx, env, {
-      sessionId: auth.tokenPayload.sid,
-      eventType: "error",
-      path: new URL(request.url).pathname,
-      method: request.method,
-      httpStatus: 429,
-      ipPrefix: extractIpPrefix(getClientIp(request)),
-      uaHash: auth.tokenPayload.ua,
-      jti: auth.tokenPayload.jti,
-      latencyMs: Date.now() - startedAt,
-    }, requestId);
+        sessionId: auth.tokenPayload.sid,
+        eventType: "error",
+        path: new URL(request.url).pathname,
+        method: request.method,
+        httpStatus: 429,
+        ipPrefix,
+        uaHash: auth.tokenPayload.ua,
+        jti: auth.tokenPayload.jti,
+        latencyMs: Date.now() - startedAt,
+      }, requestId);
+    if (abuseAutoBlockEnabled) {
+      await blockSessionForAbuse(env, auth.tokenPayload.sid, abuseBlockTtlSeconds);
+      if (abuseIpBlockEnabled) {
+        await blockIpPrefixForAbuse(env, ipPrefix, abuseBlockTtlSeconds);
+      }
+      queuePlaybackEvent(executionCtx, env, {
+        sessionId: auth.tokenPayload.sid,
+        eventType: "revoked",
+        path: new URL(request.url).pathname,
+        method: request.method,
+        httpStatus: 403,
+        ipPrefix,
+        uaHash: auth.tokenPayload.ua,
+        jti: auth.tokenPayload.jti,
+        detail: "ABUSE_AUTOBLOCK_KEY_RATE_LIMIT",
+        latencyMs: Date.now() - startedAt,
+      }, requestId);
+    }
     return json({ error: "Rate limit exceeded" }, 429);
   }
 
   if (!auth.tokenPayload.jti) {
     queuePlaybackEvent(executionCtx, env, {
-      sessionId: auth.tokenPayload.sid,
-      eventType: "error",
-      path: new URL(request.url).pathname,
-      method: request.method,
-      httpStatus: 401,
-      ipPrefix: extractIpPrefix(getClientIp(request)),
-      uaHash: auth.tokenPayload.ua,
-      latencyMs: Date.now() - startedAt,
-    }, requestId);
+        sessionId: auth.tokenPayload.sid,
+        eventType: "error",
+        path: new URL(request.url).pathname,
+        method: request.method,
+        httpStatus: 401,
+        ipPrefix,
+        uaHash: auth.tokenPayload.ua,
+        latencyMs: Date.now() - startedAt,
+      }, requestId);
     return json({ error: "Missing token nonce" }, 401);
   }
 
@@ -1140,17 +1274,35 @@ async function handleKeyRequest(request, env, executionCtx, assetId, requestId) 
 
   if (jtiReuseCount > rateConfig.keyJtiMaxReuse) {
     queuePlaybackEvent(executionCtx, env, {
-      sessionId: auth.tokenPayload.sid,
-      eventType: "error",
-      path: new URL(request.url).pathname,
-      method: request.method,
-      httpStatus: 429,
-      ipPrefix: extractIpPrefix(getClientIp(request)),
-      uaHash: auth.tokenPayload.ua,
-      jti: auth.tokenPayload.jti,
-      detail: "KEY_JTI_REUSE_LIMIT",
-      latencyMs: Date.now() - startedAt,
-    }, requestId);
+        sessionId: auth.tokenPayload.sid,
+        eventType: "error",
+        path: new URL(request.url).pathname,
+        method: request.method,
+        httpStatus: 429,
+        ipPrefix,
+        uaHash: auth.tokenPayload.ua,
+        jti: auth.tokenPayload.jti,
+        detail: "KEY_JTI_REUSE_LIMIT",
+        latencyMs: Date.now() - startedAt,
+      }, requestId);
+    if (abuseAutoBlockEnabled) {
+      await blockSessionForAbuse(env, auth.tokenPayload.sid, abuseBlockTtlSeconds);
+      if (abuseIpBlockEnabled) {
+        await blockIpPrefixForAbuse(env, ipPrefix, abuseBlockTtlSeconds);
+      }
+      queuePlaybackEvent(executionCtx, env, {
+        sessionId: auth.tokenPayload.sid,
+        eventType: "revoked",
+        path: new URL(request.url).pathname,
+        method: request.method,
+        httpStatus: 403,
+        ipPrefix,
+        uaHash: auth.tokenPayload.ua,
+        jti: auth.tokenPayload.jti,
+        detail: "ABUSE_AUTOBLOCK_KEY_JTI_REUSE",
+        latencyMs: Date.now() - startedAt,
+      }, requestId);
+    }
     return json({ error: "Key token reuse limit exceeded" }, 429);
   }
 
@@ -1195,7 +1347,7 @@ async function handleKeyRequest(request, env, executionCtx, assetId, requestId) 
     path: new URL(request.url).pathname,
     method: request.method,
     httpStatus: 200,
-    ipPrefix: extractIpPrefix(getClientIp(request)),
+    ipPrefix,
     uaHash: auth.tokenPayload.ua,
     jti: auth.tokenPayload.jti,
     latencyMs: Date.now() - startedAt,
@@ -1212,9 +1364,28 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const requestId = getRequestId(request);
+    const clientIpPrefix = getClientIpPrefix(request);
 
     if (request.method === "OPTIONS" && isPlaybackRoute(path)) {
       return buildCorsPreflightResponse(request, env, requestId);
+    }
+
+    if (isPlaybackRoute(path) && (await isIpPrefixBlockedForAbuse(env, clientIpPrefix))) {
+      return applyResponseHeaders(
+        json(
+          {
+            error: "Blocked due to abuse policy",
+            detail: "ip_prefix_blocked_abuse",
+          },
+          403,
+          {
+            "Cache-Control": "no-store",
+          },
+        ),
+        request,
+        env,
+        requestId,
+      );
     }
 
     if (isPlaybackRoute(path) && request.method !== "GET") {
