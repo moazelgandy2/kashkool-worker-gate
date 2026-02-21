@@ -2,9 +2,14 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 const inMemoryRateWindow = new Map();
 const inMemoryJtiWindow = new Map();
+const inMemorySessionValidationWindow = new Map();
 const SWEEP_INTERVAL = 250;
 let inMemorySweepCounter = 0;
+let hasLoggedPlaybackEventMissingConfig = false;
 const CONTROL_PLANE_TIMEOUT_MS = 5_000;
+const CONTROL_PLANE_RETRY_DELAY_MS = 250;
+const CONTROL_PLANE_MAX_ATTEMPTS = 2;
+const DEFAULT_SESSION_VALIDATION_CACHE_TTL_SECONDS = 10;
 
 const DEFAULT_RATE_CONFIG = {
   manifestPerMinute: 60,
@@ -32,8 +37,75 @@ function getAllowedOrigins(env) {
     .filter((item) => item.length > 0);
 }
 
+function getCorsAllowOrigin(request, env) {
+  const allowedOrigins = getAllowedOrigins(env);
+  const origin = request.headers.get("Origin");
+  if (!origin) return null;
+  if (!allowedOrigins.includes(origin)) return null;
+  return origin;
+}
+
+function applyResponseHeaders(response, request, env, requestId) {
+  const allowOrigin = getCorsAllowOrigin(request, env);
+  const headers = new Headers(response.headers);
+  headers.set("x-kashkool-request-id", requestId);
+
+  if (!allowOrigin) {
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  headers.set("Access-Control-Allow-Origin", allowOrigin);
+  headers.set("Vary", "Origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function buildCorsPreflightResponse(request, env, requestId) {
+  const allowOrigin = getCorsAllowOrigin(request, env);
+  if (!allowOrigin) {
+    return applyResponseHeaders(
+      json({ error: "Origin not allowed" }, 403, {
+        "Cache-Control": "no-store",
+      }),
+      request,
+      env,
+      requestId,
+    );
+  }
+
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": allowOrigin,
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "600",
+      "x-kashkool-request-id": requestId,
+      Vary: "Origin",
+    },
+  });
+}
+
+function isPlaybackRoute(path) {
+  return (
+    /^\/v\/[^/]+\/master\.m3u8$/.test(path) ||
+    /^\/v\/[^/]+\/[^/]+\/index\.m3u8$/.test(path) ||
+    /^\/v\/[^/]+\/[^/]+\/[^/]+$/.test(path) ||
+    /^\/k\/[^/]+$/.test(path)
+  );
+}
+
 function sanitizeEnvString(value) {
-  return String(value || "").replace(/^\uFEFF/, "").trim();
+  return String(value || "")
+    .replace(/^\uFEFF/, "")
+    .trim();
 }
 
 function normalizeBaseUrl(baseUrl) {
@@ -60,7 +132,10 @@ function validateRequestContext(request, env) {
 
   const allowedOrigins = getAllowedOrigins(env);
   if (allowedOrigins.length === 0) {
-    return { ok: false, reason: "Strict request context enabled without allowed origins" };
+    return {
+      ok: false,
+      reason: "Strict request context enabled without allowed origins",
+    };
   }
 
   const origin = request.headers.get("Origin");
@@ -77,7 +152,10 @@ function validateRequestContext(request, env) {
 
   if (
     referer &&
-    !allowedOrigins.some((allowedOrigin) => referer.startsWith(`${allowedOrigin}/`) || referer === allowedOrigin)
+    !allowedOrigins.some(
+      (allowedOrigin) =>
+        referer.startsWith(`${allowedOrigin}/`) || referer === allowedOrigin,
+    )
   ) {
     return { ok: false, reason: "Referer not allowed" };
   }
@@ -118,6 +196,45 @@ function getRateConfig(env) {
   };
 }
 
+function getSessionValidationCacheTtlSeconds(env) {
+  const parsed = parsePositiveInt(
+    env.VIDEO_GATE_SESSION_VALIDATION_CACHE_TTL_SECONDS,
+    DEFAULT_SESSION_VALIDATION_CACHE_TTL_SECONDS,
+  );
+
+  if (env.VIDEO_GATE_KV) {
+    return Math.max(60, parsed);
+  }
+
+  return parsed;
+}
+
+function sessionValidationCacheKey(tokenPayload) {
+  return `sv:${tokenPayload.sid}:${tokenPayload.v ?? 0}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getRequestId(request) {
+  const fromHeader = request.headers.get("x-kashkool-request-id")?.trim();
+  if (fromHeader) {
+    return fromHeader;
+  }
+  return crypto.randomUUID();
+}
+
+function logMissingEnvConfig(code, requestId, fields) {
+  console.error(
+    code,
+    JSON.stringify({
+      requestId,
+      ...fields,
+    }),
+  );
+}
+
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -134,7 +251,10 @@ function toBase64(value) {
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
   }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function parseToken(token) {
@@ -190,14 +310,19 @@ function toBase64UrlBytes(value) {
 }
 
 async function getAesKeyFromSecret(secret) {
-  const digest = await crypto.subtle.digest("SHA-256", toBase64UrlBytes(secret));
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    toBase64UrlBytes(secret),
+  );
   return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, [
     "decrypt",
   ]);
 }
 
 async function unwrapContentKey(wrappedContentKey, secret) {
-  const [version, ivBase64, payloadBase64] = (wrappedContentKey || "").split(":");
+  const [version, ivBase64, payloadBase64] = (wrappedContentKey || "").split(
+    ":",
+  );
   if (version !== "v1" || !ivBase64 || !payloadBase64) {
     throw new Error("Unsupported wrapped content key format");
   }
@@ -218,7 +343,7 @@ async function unwrapContentKey(wrappedContentKey, secret) {
   return new Uint8Array(rawKeyBuffer);
 }
 
-async function fetchPlaybackKeyMaterial(env, tokenPayload) {
+async function fetchPlaybackKeyMaterial(env, tokenPayload, requestId) {
   const keyUrl = resolveControlPlaneEndpoint(
     env,
     "VIDEO_GATE_KEY_URL",
@@ -226,34 +351,56 @@ async function fetchPlaybackKeyMaterial(env, tokenPayload) {
   );
 
   if (!keyUrl || !env.VIDEO_GATE_VALIDATION_SECRET) {
+    logMissingEnvConfig("gate_key_material_missing_config", requestId, {
+      hasKeyUrl: Boolean(keyUrl),
+      hasValidationSecret: Boolean(env.VIDEO_GATE_VALIDATION_SECRET),
+    });
     return null;
   }
 
-  try {
-    const response = await fetch(keyUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
-      },
-      body: JSON.stringify({
-        sessionId: tokenPayload.sid,
-        userId: tokenPayload.uid,
-        lessonId: tokenPayload.lessonId,
-        assetId: tokenPayload.assetId,
-        tokenVersion: tokenPayload.v,
-      }),
-      signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
-    });
+  for (let attempt = 1; attempt <= CONTROL_PLANE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(keyUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
+          "x-kashkool-request-id": requestId,
+        },
+        body: JSON.stringify({
+          sessionId: tokenPayload.sid,
+          userId: tokenPayload.uid,
+          lessonId: tokenPayload.lessonId,
+          assetId: tokenPayload.assetId,
+          tokenVersion: tokenPayload.v,
+        }),
+        signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
+      });
 
-    if (!response.ok) {
+      if (!response.ok) {
+        const canRetry = response.status >= 500 && attempt < CONTROL_PLANE_MAX_ATTEMPTS;
+        if (canRetry) {
+          await sleep(CONTROL_PLANE_RETRY_DELAY_MS);
+          continue;
+        }
+        return null;
+      }
+
+      return await response.json().catch(() => null);
+    } catch (error) {
+      if (attempt < CONTROL_PLANE_MAX_ATTEMPTS) {
+        await sleep(CONTROL_PLANE_RETRY_DELAY_MS);
+        continue;
+      }
+      console.error(
+        "gate_key_material_fetch_failed",
+        error instanceof Error ? error.message : String(error),
+      );
       return null;
     }
-
-    return await response.json().catch(() => null);
-  } catch {
-    return null;
   }
+
+  return null;
 }
 
 function timingSafeEqualHex(actual, expected) {
@@ -276,7 +423,7 @@ function getClientIp(request) {
   return fromHeader || undefined;
 }
 
-async function validateSessionWithControlPlane(env, tokenPayload) {
+async function validateSessionWithControlPlane(env, tokenPayload, requestId) {
   const validationUrl = resolveControlPlaneEndpoint(
     env,
     "VIDEO_GATE_VALIDATION_URL",
@@ -284,35 +431,98 @@ async function validateSessionWithControlPlane(env, tokenPayload) {
   );
 
   if (!validationUrl || !env.VIDEO_GATE_VALIDATION_SECRET) {
-    return true;
-  }
-
-  try {
-    const response = await fetch(validationUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
-      },
-      body: JSON.stringify({
-        sessionId: tokenPayload.sid,
-        userId: tokenPayload.uid,
-        lessonId: tokenPayload.lessonId,
-        assetId: tokenPayload.assetId,
-        tokenVersion: tokenPayload.v,
-      }),
-      signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
+    logMissingEnvConfig("gate_session_validation_missing_config", requestId, {
+      hasValidationUrl: Boolean(validationUrl),
+      hasValidationSecret: Boolean(env.VIDEO_GATE_VALIDATION_SECRET),
     });
-
-    if (!response.ok) return false;
-    const body = await response.json().catch(() => ({ ok: false }));
-    return body.ok === true;
-  } catch {
     return false;
   }
+
+  const now = Date.now();
+  const cacheTtlSeconds = getSessionValidationCacheTtlSeconds(env);
+  const cacheKey = sessionValidationCacheKey(tokenPayload);
+
+  if (env.VIDEO_GATE_KV) {
+    const raw = await env.VIDEO_GATE_KV.get(cacheKey);
+    if (raw) {
+      try {
+        const cached = JSON.parse(raw);
+        if (
+          cached &&
+          typeof cached.ok === "boolean" &&
+          typeof cached.expiresAt === "number" &&
+          cached.expiresAt > now
+        ) {
+          return cached.ok;
+        }
+      } catch {
+        // Ignore cache parse errors and fall through to control-plane call.
+      }
+    }
+  } else {
+    const cached = inMemorySessionValidationWindow.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.ok;
+    }
+  }
+
+  let result = false;
+  for (let attempt = 1; attempt <= CONTROL_PLANE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(validationUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
+          "x-kashkool-request-id": requestId,
+        },
+        body: JSON.stringify({
+          sessionId: tokenPayload.sid,
+          userId: tokenPayload.uid,
+          lessonId: tokenPayload.lessonId,
+          assetId: tokenPayload.assetId,
+          tokenVersion: tokenPayload.v,
+        }),
+        signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
+      });
+
+      if (!response.ok) {
+        const canRetry = response.status >= 500 && attempt < CONTROL_PLANE_MAX_ATTEMPTS;
+        if (canRetry) {
+          await sleep(CONTROL_PLANE_RETRY_DELAY_MS);
+          continue;
+        }
+        result = false;
+        break;
+      }
+
+      const body = await response.json().catch(() => ({ ok: false }));
+      result = body.ok === true;
+      break;
+    } catch {
+      if (attempt < CONTROL_PLANE_MAX_ATTEMPTS) {
+        await sleep(CONTROL_PLANE_RETRY_DELAY_MS);
+        continue;
+      }
+      result = false;
+    }
+  }
+
+  const expiresAt = now + cacheTtlSeconds * 1000;
+  if (env.VIDEO_GATE_KV) {
+    await env.VIDEO_GATE_KV.put(
+      cacheKey,
+      JSON.stringify({ ok: result, expiresAt }),
+      { expirationTtl: cacheTtlSeconds },
+    );
+  } else {
+    inMemorySessionValidationWindow.set(cacheKey, { ok: result, expiresAt });
+  }
+
+  return result;
 }
 
-async function emitPlaybackEvent(env, payload) {
+async function emitPlaybackEvent(env, payload, requestId) {
   const eventUrl = resolveControlPlaneEndpoint(
     env,
     "VIDEO_GATE_EVENT_URL",
@@ -320,6 +530,17 @@ async function emitPlaybackEvent(env, payload) {
   );
 
   if (!eventUrl || !env.VIDEO_GATE_VALIDATION_SECRET) {
+    if (!hasLoggedPlaybackEventMissingConfig) {
+      hasLoggedPlaybackEventMissingConfig = true;
+      console.warn(
+        "gate_playback_event_missing_config",
+        JSON.stringify({
+          hasEventUrl: Boolean(eventUrl),
+          hasValidationSecret: Boolean(env.VIDEO_GATE_VALIDATION_SECRET),
+          requestId,
+        }),
+      );
+    }
     return;
   }
 
@@ -329,11 +550,16 @@ async function emitPlaybackEvent(env, payload) {
       headers: {
         "Content-Type": "application/json",
         "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
+        "x-kashkool-request-id": requestId,
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
     });
-  } catch {
+  } catch (error) {
+    console.error(
+      "gate_playback_event_emit_failed",
+      error instanceof Error ? error.message : String(error),
+    );
     // Do not fail playback if telemetry fails.
   }
 }
@@ -341,11 +567,13 @@ async function emitPlaybackEvent(env, payload) {
 export function __resetForTests() {
   inMemoryRateWindow.clear();
   inMemoryJtiWindow.clear();
+  inMemorySessionValidationWindow.clear();
   inMemorySweepCounter = 0;
+  hasLoggedPlaybackEventMissingConfig = false;
 }
 
-function queuePlaybackEvent(executionCtx, env, payload) {
-  const promise = emitPlaybackEvent(env, payload);
+function queuePlaybackEvent(executionCtx, env, payload, requestId) {
+  const promise = emitPlaybackEvent(env, payload, requestId);
   if (executionCtx && typeof executionCtx.waitUntil === "function") {
     executionCtx.waitUntil(promise);
   }
@@ -361,6 +589,9 @@ async function incrementRateCounter(env, scope, sessionId, windowSeconds) {
   const expiresAt = now + windowSeconds * 1000;
 
   if (env.VIDEO_GATE_KV) {
+    // NOTE: KV updates are eventually consistent and this read-modify-write
+    // can undercount under high concurrency. This trade-off is accepted for
+    // low-cost edge rate limiting.
     const current = await env.VIDEO_GATE_KV.get(key);
     const nextCount = Number(current || "0") + 1;
     await env.VIDEO_GATE_KV.put(key, String(nextCount), {
@@ -382,14 +613,13 @@ async function incrementRateCounter(env, scope, sessionId, windowSeconds) {
   return current.count;
 }
 
-async function enforceRateLimit(
-  env,
-  scope,
-  sessionId,
-  limit,
-  windowSeconds,
-) {
-  const count = await incrementRateCounter(env, scope, sessionId, windowSeconds);
+async function enforceRateLimit(env, scope, sessionId, limit, windowSeconds) {
+  const count = await incrementRateCounter(
+    env,
+    scope,
+    sessionId,
+    windowSeconds,
+  );
   return count <= limit;
 }
 
@@ -399,6 +629,9 @@ async function rememberJti(env, sessionId, jti, windowSeconds) {
   const expiresAt = now + windowSeconds * 1000;
 
   if (env.VIDEO_GATE_KV) {
+    // NOTE: KV updates are eventually consistent and this read-modify-write
+    // can undercount under high concurrency. This trade-off is accepted for
+    // low-cost edge replay tracking.
     const existing = await env.VIDEO_GATE_KV.get(key);
     const nextCount = Number(existing || "0") + 1;
     await env.VIDEO_GATE_KV.put(key, String(nextCount), {
@@ -422,7 +655,11 @@ async function rememberJti(env, sessionId, jti, windowSeconds) {
 
 function sweepExpiredEntries(windowMap, now) {
   for (const [key, value] of windowMap) {
-    if (!value || typeof value.expiresAt !== "number" || value.expiresAt <= now) {
+    if (
+      !value ||
+      typeof value.expiresAt !== "number" ||
+      value.expiresAt <= now
+    ) {
       windowMap.delete(key);
     }
   }
@@ -436,9 +673,16 @@ function sweepInMemoryWindows(now) {
 
   sweepExpiredEntries(inMemoryRateWindow, now);
   sweepExpiredEntries(inMemoryJtiWindow, now);
+  sweepExpiredEntries(inMemorySessionValidationWindow, now);
 }
 
-async function authorizeRequest(request, env, expectedAssetId, expectedSessionId) {
+async function authorizeRequest(
+  request,
+  env,
+  expectedAssetId,
+  expectedSessionId,
+  requestId,
+) {
   const token = new URL(request.url).searchParams.get("token") || "";
   const parsed = parseToken(token);
   if (!parsed) {
@@ -446,6 +690,7 @@ async function authorizeRequest(request, env, expectedAssetId, expectedSessionId
   }
 
   if (!env.VIDEO_PLAYBACK_TOKEN_SECRET) {
+    logMissingEnvConfig("gate_missing_playback_token_secret", requestId, {});
     return { ok: false, status: 500, message: "Missing playback token secret" };
   }
 
@@ -462,7 +707,10 @@ async function authorizeRequest(request, env, expectedAssetId, expectedSessionId
     return { ok: false, status: 401, message: "Expired token" };
   }
 
-  if (typeof parsed.payload?.sid !== "string" || parsed.payload.sid.length === 0) {
+  if (
+    typeof parsed.payload?.sid !== "string" ||
+    parsed.payload.sid.length === 0
+  ) {
     return { ok: false, status: 401, message: "Missing token session scope" };
   }
 
@@ -484,7 +732,11 @@ async function authorizeRequest(request, env, expectedAssetId, expectedSessionId
     return { ok: false, status: 401, message: "IP prefix mismatch" };
   }
 
-  const sessionValid = await validateSessionWithControlPlane(env, parsed.payload);
+  const sessionValid = await validateSessionWithControlPlane(
+    env,
+    parsed.payload,
+    requestId,
+  );
   if (!sessionValid) {
     return { ok: false, status: 401, message: "Session validation failed" };
   }
@@ -538,10 +790,21 @@ function keyHeaders() {
   };
 }
 
-async function handleMasterManifest(request, env, executionCtx, assetId) {
+function isSafePathPart(value) {
+  return typeof value === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value);
+}
+
+async function handleMasterManifest(request, env, executionCtx, assetId, requestId) {
   const startedAt = Date.now();
+  if (!env.VIDEO_DELIVERY_BUCKET) {
+    logMissingEnvConfig("gate_missing_delivery_bucket_binding", requestId, {
+      route: "master_manifest",
+    });
+    return json({ error: "Missing delivery bucket binding" }, 500);
+  }
+
   const rateConfig = getRateConfig(env);
-  const auth = await authorizeRequest(request, env, assetId);
+  const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
   if (!auth.ok) return json({ error: auth.message }, auth.status);
 
   const allowed = await enforceRateLimit(
@@ -552,6 +815,18 @@ async function handleMasterManifest(request, env, executionCtx, assetId) {
     60,
   );
   if (!allowed) {
+    queuePlaybackEvent(executionCtx, env, {
+      sessionId: auth.tokenPayload.sid,
+      eventType: "error",
+      path: new URL(request.url).pathname,
+      method: request.method,
+      httpStatus: 429,
+      ipPrefix: extractIpPrefix(getClientIp(request)),
+      uaHash: auth.tokenPayload.ua,
+      jti: auth.tokenPayload.jti,
+      detail: "MANIFEST_RATE_LIMIT",
+      latencyMs: Date.now() - startedAt,
+    }, requestId);
     return json({ error: "Rate limit exceeded" }, 429);
   }
 
@@ -570,17 +845,35 @@ async function handleMasterManifest(request, env, executionCtx, assetId) {
     uaHash: auth.tokenPayload.ua,
     jti: auth.tokenPayload.jti,
     latencyMs: Date.now() - startedAt,
-  });
+  }, requestId);
   return new Response(rewriteManifest(content, auth.token), {
     status: 200,
     headers: manifestHeaders(),
   });
 }
 
-async function handleRenditionManifest(request, env, executionCtx, assetId, rendition) {
+async function handleRenditionManifest(
+  request,
+  env,
+  executionCtx,
+  assetId,
+  rendition,
+  requestId,
+) {
   const startedAt = Date.now();
+  if (!env.VIDEO_DELIVERY_BUCKET) {
+    logMissingEnvConfig("gate_missing_delivery_bucket_binding", requestId, {
+      route: "rendition_manifest",
+    });
+    return json({ error: "Missing delivery bucket binding" }, 500);
+  }
+
+  if (!isSafePathPart(rendition)) {
+    return json({ error: "Invalid rendition" }, 400);
+  }
+
   const rateConfig = getRateConfig(env);
-  const auth = await authorizeRequest(request, env, assetId);
+  const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
   if (!auth.ok) return json({ error: auth.message }, auth.status);
 
   const allowed = await enforceRateLimit(
@@ -591,6 +884,18 @@ async function handleRenditionManifest(request, env, executionCtx, assetId, rend
     60,
   );
   if (!allowed) {
+    queuePlaybackEvent(executionCtx, env, {
+      sessionId: auth.tokenPayload.sid,
+      eventType: "error",
+      path: new URL(request.url).pathname,
+      method: request.method,
+      httpStatus: 429,
+      ipPrefix: extractIpPrefix(getClientIp(request)),
+      uaHash: auth.tokenPayload.ua,
+      jti: auth.tokenPayload.jti,
+      detail: "PLAYLIST_RATE_LIMIT",
+      latencyMs: Date.now() - startedAt,
+    }, requestId);
     return json({ error: "Rate limit exceeded" }, 429);
   }
 
@@ -609,17 +914,39 @@ async function handleRenditionManifest(request, env, executionCtx, assetId, rend
     uaHash: auth.tokenPayload.ua,
     jti: auth.tokenPayload.jti,
     latencyMs: Date.now() - startedAt,
-  });
+  }, requestId);
   return new Response(rewriteManifest(content, auth.token), {
     status: 200,
     headers: manifestHeaders(),
   });
 }
 
-async function handleSegment(request, env, executionCtx, assetId, rendition, segmentName) {
+async function handleSegment(
+  request,
+  env,
+  executionCtx,
+  assetId,
+  rendition,
+  segmentName,
+  requestId,
+) {
   const startedAt = Date.now();
+  if (!env.VIDEO_DELIVERY_BUCKET) {
+    logMissingEnvConfig("gate_missing_delivery_bucket_binding", requestId, {
+      route: "segment",
+    });
+    return json({ error: "Missing delivery bucket binding" }, 500);
+  }
+
+  if (!isSafePathPart(rendition)) {
+    return json({ error: "Invalid rendition" }, 400);
+  }
+  if (!isSafePathPart(segmentName)) {
+    return json({ error: "Invalid segment" }, 400);
+  }
+
   const rateConfig = getRateConfig(env);
-  const auth = await authorizeRequest(request, env, assetId);
+  const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
   if (!auth.ok) return json({ error: auth.message }, auth.status);
 
   const allowed = await enforceRateLimit(
@@ -630,11 +957,22 @@ async function handleSegment(request, env, executionCtx, assetId, rendition, seg
     60,
   );
   if (!allowed) {
+    queuePlaybackEvent(executionCtx, env, {
+      sessionId: auth.tokenPayload.sid,
+      eventType: "error",
+      path: new URL(request.url).pathname,
+      method: request.method,
+      httpStatus: 429,
+      ipPrefix: extractIpPrefix(getClientIp(request)),
+      uaHash: auth.tokenPayload.ua,
+      jti: auth.tokenPayload.jti,
+      detail: "SEGMENT_RATE_LIMIT",
+      latencyMs: Date.now() - startedAt,
+    }, requestId);
     return json({ error: "Rate limit exceeded" }, 429);
   }
 
-  const safeSegmentName = segmentName.replace(/\.\./g, "");
-  const key = `org/${auth.tokenPayload.oid}/lesson/${auth.tokenPayload.lessonId}/asset/${assetId}/${rendition}/${safeSegmentName}`;
+  const key = `org/${auth.tokenPayload.oid}/lesson/${auth.tokenPayload.lessonId}/asset/${assetId}/${rendition}/${segmentName}`;
   const object = await env.VIDEO_DELIVERY_BUCKET.get(key);
   if (!object) return new Response("Not found", { status: 404 });
 
@@ -648,7 +986,7 @@ async function handleSegment(request, env, executionCtx, assetId, rendition, seg
     uaHash: auth.tokenPayload.ua,
     jti: auth.tokenPayload.jti,
     latencyMs: Date.now() - startedAt,
-  });
+  }, requestId);
 
   return new Response(object.body, {
     status: 200,
@@ -656,10 +994,10 @@ async function handleSegment(request, env, executionCtx, assetId, rendition, seg
   });
 }
 
-async function handleKeyRequest(request, env, executionCtx, assetId) {
+async function handleKeyRequest(request, env, executionCtx, assetId, requestId) {
   const startedAt = Date.now();
   const rateConfig = getRateConfig(env);
-  const auth = await authorizeRequest(request, env, assetId);
+  const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
   if (!auth.ok) return json({ error: auth.message }, auth.status);
 
   const allowed = await enforceRateLimit(
@@ -680,7 +1018,7 @@ async function handleKeyRequest(request, env, executionCtx, assetId) {
       uaHash: auth.tokenPayload.ua,
       jti: auth.tokenPayload.jti,
       latencyMs: Date.now() - startedAt,
-    });
+    }, requestId);
     return json({ error: "Rate limit exceeded" }, 429);
   }
 
@@ -694,7 +1032,7 @@ async function handleKeyRequest(request, env, executionCtx, assetId) {
       ipPrefix: extractIpPrefix(getClientIp(request)),
       uaHash: auth.tokenPayload.ua,
       latencyMs: Date.now() - startedAt,
-    });
+    }, requestId);
     return json({ error: "Missing token nonce" }, 401);
   }
 
@@ -717,7 +1055,7 @@ async function handleKeyRequest(request, env, executionCtx, assetId) {
       jti: auth.tokenPayload.jti,
       detail: "KEY_JTI_REUSE_LIMIT",
       latencyMs: Date.now() - startedAt,
-    });
+    }, requestId);
     return json({ error: "Key token reuse limit exceeded" }, 429);
   }
 
@@ -729,10 +1067,15 @@ async function handleKeyRequest(request, env, executionCtx, assetId) {
   }
 
   if (!env.VIDEO_KEY_ENCRYPTION_SECRET) {
+    logMissingEnvConfig("gate_missing_key_encryption_secret", requestId, {});
     return json({ error: "Missing key encryption secret" }, 500);
   }
 
-  const keyMaterial = await fetchPlaybackKeyMaterial(env, auth.tokenPayload);
+  const keyMaterial = await fetchPlaybackKeyMaterial(
+    env,
+    auth.tokenPayload,
+    requestId,
+  );
   if (!keyMaterial?.wrappedContentKey) {
     return new Response("Not found", { status: 404 });
   }
@@ -740,7 +1083,16 @@ async function handleKeyRequest(request, env, executionCtx, assetId) {
   const rawKey = await unwrapContentKey(
     keyMaterial.wrappedContentKey,
     env.VIDEO_KEY_ENCRYPTION_SECRET,
-  );
+  ).catch((error) => {
+    console.error(
+      "gate_unwrap_content_key_failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
+  });
+  if (!rawKey) {
+    return new Response("Not found", { status: 404 });
+  }
 
   queuePlaybackEvent(executionCtx, env, {
     sessionId: auth.tokenPayload.sid,
@@ -752,7 +1104,7 @@ async function handleKeyRequest(request, env, executionCtx, assetId) {
     uaHash: auth.tokenPayload.ua,
     jti: auth.tokenPayload.jti,
     latencyMs: Date.now() - startedAt,
-  });
+  }, requestId);
 
   return new Response(rawKey, {
     status: 200,
@@ -764,24 +1116,52 @@ export default {
   async fetch(request, env, executionCtx) {
     const url = new URL(request.url);
     const path = url.pathname;
+    const requestId = getRequestId(request);
+
+    if (request.method === "OPTIONS" && isPlaybackRoute(path)) {
+      return buildCorsPreflightResponse(request, env, requestId);
+    }
+
+    if (isPlaybackRoute(path) && request.method !== "GET") {
+      return applyResponseHeaders(
+        json({ error: "Method Not Allowed" }, 405, {
+          Allow: "GET, OPTIONS",
+          "Cache-Control": "no-store",
+        }),
+        request,
+        env,
+        requestId,
+      );
+    }
 
     if (env.VIDEO_GATE_MAINTENANCE_MODE === "true" && path !== "/health") {
-      return json(
+      return applyResponseHeaders(
+        json(
         { error: "Playback is temporarily unavailable", code: "MAINTENANCE" },
         503,
         {
           "Cache-Control": "no-store",
         },
+        ),
+        request,
+        env,
+        requestId,
       );
     }
 
     if (path === "/health") {
-      return json({ ok: true, service: "kashkool-video-gate" });
+      return applyResponseHeaders(
+        json({ ok: true, service: "kashkool-video-gate" }),
+        request,
+        env,
+        requestId,
+      );
     }
 
     const contextValidation = validateRequestContext(request, env);
     if (!contextValidation.ok) {
-      return json(
+      return applyResponseHeaders(
+        json(
         {
           error: "Request context validation failed",
           detail: contextValidation.reason,
@@ -790,42 +1170,69 @@ export default {
         {
           "Cache-Control": "no-store",
         },
+        ),
+        request,
+        env,
+        requestId,
       );
     }
 
     const masterMatch = path.match(/^\/v\/([^/]+)\/master\.m3u8$/);
     if (masterMatch) {
-      return handleMasterManifest(request, env, executionCtx, masterMatch[1]);
+      const response = await handleMasterManifest(
+        request,
+        env,
+        executionCtx,
+        masterMatch[1],
+        requestId,
+      );
+      return applyResponseHeaders(response, request, env, requestId);
     }
 
     const renditionMatch = path.match(/^\/v\/([^/]+)\/([^/]+)\/index\.m3u8$/);
     if (renditionMatch) {
-      return handleRenditionManifest(
+      const response = await handleRenditionManifest(
         request,
         env,
         executionCtx,
         renditionMatch[1],
         renditionMatch[2],
+        requestId,
       );
+      return applyResponseHeaders(response, request, env, requestId);
     }
 
     const segmentMatch = path.match(/^\/v\/([^/]+)\/([^/]+)\/([^/]+)$/);
     if (segmentMatch) {
-      return handleSegment(
+      const response = await handleSegment(
         request,
         env,
         executionCtx,
         segmentMatch[1],
         segmentMatch[2],
         segmentMatch[3],
+        requestId,
       );
+      return applyResponseHeaders(response, request, env, requestId);
     }
 
     const keyMatch = path.match(/^\/k\/([^/]+)$/);
     if (keyMatch) {
-      return handleKeyRequest(request, env, executionCtx, keyMatch[1]);
+      const response = await handleKeyRequest(
+        request,
+        env,
+        executionCtx,
+        keyMatch[1],
+        requestId,
+      );
+      return applyResponseHeaders(response, request, env, requestId);
     }
 
-    return new Response("Not found", { status: 404 });
+    return applyResponseHeaders(
+      new Response("Not found", { status: 404 }),
+      request,
+      env,
+      requestId,
+    );
   },
 };

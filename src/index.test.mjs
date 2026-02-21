@@ -36,6 +36,7 @@ function createEnv(overrides = {}) {
     VIDEO_PLAYBACK_TOKEN_SECRET: "token_secret",
     VIDEO_KEY_ENCRYPTION_SECRET: "key_secret",
     VIDEO_GATE_VALIDATION_SECRET: "gate_secret",
+    VIDEO_GATE_VALIDATION_URL: "https://main.local/video-playback-validate",
     VIDEO_GATE_KEY_URL: "https://main.local/video-playback-key",
     VIDEO_GATE_MAINTENANCE_MODE: "false",
     VIDEO_GATE_KEY_PER_MINUTE: "5",
@@ -113,6 +114,20 @@ test("rejects tampered token signature", async () => {
   assert.equal(response.status, 401);
 });
 
+test("includes request id header on auth failures", async () => {
+  const requestId = "req_auth_fail_1";
+  const env = createEnv();
+  const request = new Request("https://gate.local/v/asset_1/master.m3u8?token=bad_token", {
+    headers: {
+      "x-kashkool-request-id": requestId,
+    },
+  });
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 401);
+  assert.equal(response.headers.get("x-kashkool-request-id"), requestId);
+});
+
 test("rejects token scope mismatch", async () => {
   const payload = {
     sid: "session_2",
@@ -152,6 +167,12 @@ test("allows limited key jti reuse for seek stability", async () => {
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (String(url).includes("/video-playback-key")) {
       return new Response(
         JSON.stringify({ wrappedContentKey, contentKeyVersion: "v1" }),
@@ -196,6 +217,12 @@ test("blocks excessive key jti reuse", async () => {
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (String(url).includes("/video-playback-key")) {
       return new Response(
         JSON.stringify({ wrappedContentKey, contentKeyVersion: "v1" }),
@@ -235,6 +262,12 @@ test("enforces key endpoint rate limit", async () => {
   const wrappedContentKey = wrapKey(Buffer.from("0123456789abcdef"), "key_secret");
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (String(url).includes("/video-playback-key")) {
       return new Response(
         JSON.stringify({ wrappedContentKey, contentKeyVersion: "v1" }),
@@ -404,6 +437,284 @@ test("fails closed when control-plane validation request throws", async () => {
       env,
     );
     assert.equal(response.status, 401);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fails closed when validation config is missing", async () => {
+  const payload = {
+    sid: "session_missing_config",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "missing_config_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_VALIDATION_URL: undefined,
+    CONTROL_PLANE_BASE_URL: undefined,
+  });
+
+  const response = await worker.fetch(
+    new Request(`https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`),
+    env,
+  );
+
+  assert.equal(response.status, 401);
+});
+
+test("adds CORS header for allowed origins", async () => {
+  const payload = {
+    sid: "session_cors",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "cors_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const origin = "https://app.local";
+    const env = createEnv({ VIDEO_GATE_ALLOWED_ORIGINS: origin });
+    const response = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        { headers: { Origin: origin } },
+      ),
+      env,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Access-Control-Allow-Origin"), origin);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handles CORS preflight for playback routes", async () => {
+  const origin = "https://app.local";
+  const env = createEnv({ VIDEO_GATE_ALLOWED_ORIGINS: origin });
+
+  const response = await worker.fetch(
+    new Request("https://gate.local/v/asset_1/master.m3u8", {
+      method: "OPTIONS",
+      headers: { Origin: origin },
+    }),
+    env,
+  );
+
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), origin);
+  assert.equal(response.headers.get("Access-Control-Allow-Methods"), "GET, OPTIONS");
+  assert.ok(response.headers.get("x-kashkool-request-id"));
+});
+
+test("rejects non-GET methods on playback routes", async () => {
+  const env = createEnv();
+  const response = await worker.fetch(
+    new Request("https://gate.local/v/asset_1/master.m3u8", {
+      method: "POST",
+    }),
+    env,
+  );
+
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get("allow"), "GET, OPTIONS");
+});
+
+test("rejects invalid rendition path part", async () => {
+  const payload = {
+    sid: "session_invalid_rendition",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "invalid_rendition_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv();
+  const response = await worker.fetch(
+    new Request(
+      `https://gate.local/v/asset_1/bad%24rendition/index.m3u8?token=${encodeURIComponent(token)}`,
+    ),
+    env,
+  );
+
+  assert.equal(response.status, 400);
+});
+
+test("rejects invalid segment path part", async () => {
+  const payload = {
+    sid: "session_invalid_segment",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "invalid_segment_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv();
+  const response = await worker.fetch(
+    new Request(
+      `https://gate.local/v/asset_1/720p/%2e%2e%2fsecret.ts?token=${encodeURIComponent(token)}`,
+    ),
+    env,
+  );
+
+  assert.equal(response.status, 400);
+});
+
+test("caches session validation result for repeated requests", async () => {
+  const payload = {
+    sid: "session_cache",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "cache_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  let validationCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      validationCalls += 1;
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv({
+      VIDEO_GATE_VALIDATION_URL: "https://main.local/video-playback-validate",
+      VIDEO_GATE_SESSION_VALIDATION_CACHE_TTL_SECONDS: "30",
+    });
+    const url = `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`;
+
+    const first = await worker.fetch(new Request(url), env);
+    assert.equal(first.status, 200);
+
+    const second = await worker.fetch(new Request(url), env);
+    assert.equal(second.status, 200);
+    assert.equal(validationCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("propagates request id to control-plane validation call", async () => {
+  const payload = {
+    sid: "session_request_id",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "request_id_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const requestId = "req_test_123";
+  let seenRequestId = null;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("/video-playback-validate")) {
+      const headers = new Headers(init.headers || {});
+      seenRequestId = headers.get("x-kashkool-request-id");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv();
+    const response = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        { headers: { "x-kashkool-request-id": requestId } },
+      ),
+      env,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(seenRequestId, requestId);
+    assert.equal(response.headers.get("x-kashkool-request-id"), requestId);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("returns 404 when wrapped content key cannot be unwrapped", async () => {
+  const payload = {
+    sid: "session_bad_wrapped_key",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "bad_wrapped_key_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (String(url).includes("/video-playback-key")) {
+      return new Response(
+        JSON.stringify({ wrappedContentKey: "invalid-format", contentKeyVersion: "v1" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv();
+    const response = await worker.fetch(
+      new Request(`https://gate.local/k/asset_1?kid=main&token=${encodeURIComponent(token)}`),
+      env,
+    );
+    assert.equal(response.status, 404);
   } finally {
     globalThis.fetch = originalFetch;
   }

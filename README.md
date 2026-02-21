@@ -19,6 +19,7 @@ Edge worker for protected video playback.
 - optional session introspection against Convex (derived from `CONTROL_PLANE_BASE_URL` or explicit `VIDEO_GATE_VALIDATION_URL`)
 - key material fetch from Convex (derived from `CONTROL_PLANE_BASE_URL` or explicit `VIDEO_GATE_KEY_URL`) and worker-side key unwrap (`VIDEO_KEY_ENCRYPTION_SECRET`)
 - endpoint-level rate limiting by session ID (`manifest`, `playlist`, `segment`, `key`)
+- short-lived session-validation caching (`VIDEO_GATE_SESSION_VALIDATION_CACHE_TTL_SECONDS`, default `20`)
 - optional telemetry push to control plane (derived from `CONTROL_PLANE_BASE_URL` or explicit `VIDEO_GATE_EVENT_URL`)
 - optional strict request-context validation (`VIDEO_GATE_STRICT_REQUEST_CONTEXT`, `VIDEO_GATE_ALLOWED_ORIGINS`)
 
