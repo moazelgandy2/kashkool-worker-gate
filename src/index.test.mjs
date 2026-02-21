@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createCipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 import test from "node:test";
 
-import worker from "./index.mjs";
+import worker, { __resetForTests } from "./index.mjs";
 
 function base64UrlEncode(value) {
   return Buffer.from(value, "utf8")
@@ -54,12 +54,41 @@ function createEnv(overrides = {}) {
   };
 }
 
+test.beforeEach(() => {
+  __resetForTests();
+});
+
 test("returns maintenance response when enabled", async () => {
   const env = createEnv({ VIDEO_GATE_MAINTENANCE_MODE: "true" });
   const request = new Request("https://gate.local/v/asset_1/master.m3u8");
   const response = await worker.fetch(request, env);
 
   assert.equal(response.status, 503);
+});
+
+test("strict request context blocks requests without browser context headers", async () => {
+  const payload = {
+    sid: "session_strict_context",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "strict_context_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://app.local",
+  });
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
 });
 
 test("rejects tampered token signature", async () => {
@@ -335,6 +364,43 @@ test("enforces token expiry even when control-plane validation is enabled", asyn
     });
     const response = await worker.fetch(
       new Request(`https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`),
+      env,
+    );
+    assert.equal(response.status, 401);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fails closed when control-plane validation request throws", async () => {
+  const payload = {
+    sid: "session_validation_throw",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "validation_throw_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      throw new Error("upstream timeout");
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv({
+      VIDEO_GATE_VALIDATION_URL: "https://main.local/video-playback-validate",
+    });
+    const response = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+      ),
       env,
     );
     assert.equal(response.status, 401);

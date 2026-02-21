@@ -4,6 +4,7 @@ const inMemoryRateWindow = new Map();
 const inMemoryJtiWindow = new Map();
 const SWEEP_INTERVAL = 250;
 let inMemorySweepCounter = 0;
+const CONTROL_PLANE_TIMEOUT_MS = 5_000;
 
 const DEFAULT_RATE_CONFIG = {
   manifestPerMinute: 60,
@@ -65,6 +66,10 @@ function validateRequestContext(request, env) {
   const origin = request.headers.get("Origin");
   const referer = request.headers.get("Referer");
   const secFetchSite = request.headers.get("Sec-Fetch-Site");
+
+  if (!origin && !referer && !secFetchSite) {
+    return { ok: false, reason: "Missing browser context headers" };
+  }
 
   if (origin && !allowedOrigins.includes(origin)) {
     return { ok: false, reason: "Origin not allowed" };
@@ -224,26 +229,31 @@ async function fetchPlaybackKeyMaterial(env, tokenPayload) {
     return null;
   }
 
-  const response = await fetch(keyUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
-    },
-    body: JSON.stringify({
-      sessionId: tokenPayload.sid,
-      userId: tokenPayload.uid,
-      lessonId: tokenPayload.lessonId,
-      assetId: tokenPayload.assetId,
-      tokenVersion: tokenPayload.v,
-    }),
-  });
+  try {
+    const response = await fetch(keyUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
+      },
+      body: JSON.stringify({
+        sessionId: tokenPayload.sid,
+        userId: tokenPayload.uid,
+        lessonId: tokenPayload.lessonId,
+        assetId: tokenPayload.assetId,
+        tokenVersion: tokenPayload.v,
+      }),
+      signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
+    });
 
-  if (!response.ok) {
+    if (!response.ok) {
+      return null;
+    }
+
+    return await response.json().catch(() => null);
+  } catch {
     return null;
   }
-
-  return response.json();
 }
 
 function timingSafeEqualHex(actual, expected) {
@@ -277,24 +287,29 @@ async function validateSessionWithControlPlane(env, tokenPayload) {
     return true;
   }
 
-  const response = await fetch(validationUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
-    },
-    body: JSON.stringify({
-      sessionId: tokenPayload.sid,
-      userId: tokenPayload.uid,
-      lessonId: tokenPayload.lessonId,
-      assetId: tokenPayload.assetId,
-      tokenVersion: tokenPayload.v,
-    }),
-  });
+  try {
+    const response = await fetch(validationUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
+      },
+      body: JSON.stringify({
+        sessionId: tokenPayload.sid,
+        userId: tokenPayload.uid,
+        lessonId: tokenPayload.lessonId,
+        assetId: tokenPayload.assetId,
+        tokenVersion: tokenPayload.v,
+      }),
+      signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
+    });
 
-  if (!response.ok) return false;
-  const body = await response.json().catch(() => ({ ok: false }));
-  return body.ok === true;
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => ({ ok: false }));
+    return body.ok === true;
+  } catch {
+    return false;
+  }
 }
 
 async function emitPlaybackEvent(env, payload) {
@@ -316,10 +331,17 @@ async function emitPlaybackEvent(env, payload) {
         "x-kashkool-gate-secret": env.VIDEO_GATE_VALIDATION_SECRET,
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(CONTROL_PLANE_TIMEOUT_MS),
     });
   } catch {
     // Do not fail playback if telemetry fails.
   }
+}
+
+export function __resetForTests() {
+  inMemoryRateWindow.clear();
+  inMemoryJtiWindow.clear();
+  inMemorySweepCounter = 0;
 }
 
 function queuePlaybackEvent(executionCtx, env, payload) {
