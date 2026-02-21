@@ -143,11 +143,11 @@ function validateRequestContext(request, env) {
   const secFetchSite = request.headers.get("Sec-Fetch-Site");
 
   if (!origin && !referer && !secFetchSite) {
-    return { ok: false, reason: "Missing browser context headers" };
+    return { ok: false, reason: "missing_browser_context_headers" };
   }
 
   if (origin && !allowedOrigins.includes(origin)) {
-    return { ok: false, reason: "Origin not allowed" };
+    return { ok: false, reason: "origin_not_allowed" };
   }
 
   if (
@@ -157,11 +157,11 @@ function validateRequestContext(request, env) {
         referer.startsWith(`${allowedOrigin}/`) || referer === allowedOrigin,
     )
   ) {
-    return { ok: false, reason: "Referer not allowed" };
+    return { ok: false, reason: "referer_not_allowed" };
   }
 
-  if (secFetchSite && secFetchSite === "cross-site") {
-    return { ok: false, reason: "Cross-site fetch blocked" };
+  if (secFetchSite && !["same-origin", "same-site", "cross-site", "none"].includes(secFetchSite)) {
+    return { ok: false, reason: "invalid_sec_fetch_site" };
   }
 
   return { ok: true };
