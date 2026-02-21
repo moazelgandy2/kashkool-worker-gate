@@ -129,6 +129,7 @@ test("strict request context allows cross-site when origin is allowlisted", asyn
           Origin: "https://app.local",
           Referer: "https://app.local/watch",
           "Sec-Fetch-Site": "cross-site",
+          "Sec-Fetch-Mode": "cors",
         },
       },
     );
@@ -177,6 +178,7 @@ test("strict request context allows one-level wildcard subdomain", async () => {
           Origin: "https://moaz.kashkool.online",
           Referer: "https://moaz.kashkool.online/watch",
           "Sec-Fetch-Site": "cross-site",
+          "Sec-Fetch-Mode": "cors",
         },
       },
     );
@@ -317,6 +319,216 @@ test("strict request context blocks cross-site when referer is not allowlisted",
 
   const response = await worker.fetch(request, env);
   assert.equal(response.status, 403);
+});
+
+test("strict request context requires origin when configured", async () => {
+  const payload = {
+    sid: "session_origin_required",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "origin_required_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://app.local",
+    VIDEO_GATE_REQUIRE_ORIGIN: "true",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        Referer: "https://app.local/watch",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "cors",
+      },
+    },
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
+  const body = await response.json();
+  assert.equal(body.detail, "origin_missing");
+});
+
+test("strict request context requires sec-fetch headers when configured", async () => {
+  const payload = {
+    sid: "session_sec_fetch_required",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "sec_fetch_required_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://app.local",
+    VIDEO_GATE_REQUIRE_SEC_FETCH: "true",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        Origin: "https://app.local",
+        Referer: "https://app.local/watch",
+      },
+    },
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
+  const body = await response.json();
+  assert.equal(body.detail, "sec_fetch_missing");
+});
+
+test("blocks known downloader user agent", async () => {
+  const payload = {
+    sid: "session_downloader_ua",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "downloader_ua_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_BLOCK_KNOWN_DOWNLOADER_UA: "true",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        "user-agent": "yt-dlp/2026.01.01",
+      },
+    },
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
+  const body = await response.json();
+  assert.equal(body.detail, "known_downloader_ua");
+});
+
+test("allows one IP drift grace then blocks session", async () => {
+  const payload = {
+    sid: "session_ip_sticky",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "ip_sticky_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_ENFORCE_SESSION_IP_STICKY: "true",
+    VIDEO_GATE_IP_STICKY_GRACE_ENABLED: "true",
+    VIDEO_GATE_IP_STICKY_GRACE_SECONDS: "60",
+    VIDEO_GATE_ABUSE_AUTOBLOCK_ENABLED: "true",
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const first = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        {
+          headers: {
+            "cf-connecting-ip": "1.1.1.10",
+          },
+        },
+      ),
+      env,
+    );
+    assert.equal(first.status, 200);
+
+    const second = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        {
+          headers: {
+            "cf-connecting-ip": "1.1.2.10",
+          },
+        },
+      ),
+      env,
+    );
+    assert.equal(second.status, 200);
+
+    const third = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        {
+          headers: {
+            "cf-connecting-ip": "1.1.3.10",
+          },
+        },
+      ),
+      env,
+    );
+    assert.equal(third.status, 403);
+    const body = await third.json();
+    assert.equal(body.detail, "session_ip_drift");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("blocks stale heartbeat for heartbeat-required token", async () => {
+  const payload = {
+    sid: "session_heartbeat_stale",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "heartbeat_stale_jti",
+    hbr: true,
+    hb: Date.now() - 120_000,
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_REQUIRE_HEARTBEAT: "true",
+    VIDEO_GATE_HEARTBEAT_MAX_AGE_SECONDS: "40",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 401);
+  const body = await response.json();
+  assert.equal(body.detail, "heartbeat_stale");
 });
 
 test("rejects tampered token signature", async () => {

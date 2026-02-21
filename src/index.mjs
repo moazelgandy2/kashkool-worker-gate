@@ -5,6 +5,8 @@ const inMemoryJtiWindow = new Map();
 const inMemorySessionValidationWindow = new Map();
 const inMemoryAbuseBlockWindow = new Map();
 const inMemoryAbuseIpBlockWindow = new Map();
+const inMemorySessionIpStickyWindow = new Map();
+const inMemorySessionIpGraceWindow = new Map();
 const SWEEP_INTERVAL = 250;
 let inMemorySweepCounter = 0;
 let hasLoggedPlaybackEventMissingConfig = false;
@@ -12,7 +14,11 @@ const CONTROL_PLANE_TIMEOUT_MS = 5_000;
 const CONTROL_PLANE_RETRY_DELAY_MS = 250;
 const CONTROL_PLANE_MAX_ATTEMPTS = 2;
 const DEFAULT_SESSION_VALIDATION_CACHE_TTL_SECONDS = 10;
+const DEFAULT_SESSION_VALIDATION_CACHE_MAX_FOR_HEARTBEAT_SECONDS = 15;
 const DEFAULT_ABUSE_BLOCK_TTL_SECONDS = 10 * 60;
+const DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 40;
+const DEFAULT_SESSION_IP_STICKY_TTL_SECONDS = 20 * 60;
+const DEFAULT_SESSION_IP_STICKY_GRACE_SECONDS = 60;
 
 const DEFAULT_RATE_CONFIG = {
   manifestPerMinute: 60,
@@ -99,6 +105,72 @@ function getAllowedOriginRules(env) {
   return getAllowedOrigins(env)
     .map(parseAllowedOriginRule)
     .filter(Boolean);
+}
+
+function getRequireOrigin(env) {
+  return parseBoolean(env.VIDEO_GATE_REQUIRE_ORIGIN, true);
+}
+
+function getRequireSecFetch(env) {
+  return parseBoolean(env.VIDEO_GATE_REQUIRE_SEC_FETCH, true);
+}
+
+function getBlockKnownDownloaderUa(env) {
+  return parseBoolean(env.VIDEO_GATE_BLOCK_KNOWN_DOWNLOADER_UA, true);
+}
+
+function getRequireHeartbeat(env) {
+  return parseBoolean(env.VIDEO_GATE_REQUIRE_HEARTBEAT, true);
+}
+
+function getHeartbeatMaxAgeSeconds(env) {
+  return parsePositiveInt(
+    env.VIDEO_GATE_HEARTBEAT_MAX_AGE_SECONDS,
+    DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+  );
+}
+
+function getSessionIpStickyEnabled(env) {
+  return parseBoolean(env.VIDEO_GATE_ENFORCE_SESSION_IP_STICKY, true);
+}
+
+function getSessionIpStickyTtlSeconds(env) {
+  return parsePositiveInt(
+    env.VIDEO_GATE_SESSION_IP_STICKY_TTL_SECONDS,
+    DEFAULT_SESSION_IP_STICKY_TTL_SECONDS,
+  );
+}
+
+function getSessionIpStickyGraceEnabled(env) {
+  return parseBoolean(env.VIDEO_GATE_IP_STICKY_GRACE_ENABLED, true);
+}
+
+function getSessionIpStickyGraceSeconds(env) {
+  return parsePositiveInt(
+    env.VIDEO_GATE_IP_STICKY_GRACE_SECONDS,
+    DEFAULT_SESSION_IP_STICKY_GRACE_SECONDS,
+  );
+}
+
+function isKnownDownloaderUserAgent(userAgent) {
+  const normalized = String(userAgent || "").toLowerCase();
+  if (!normalized) return false;
+
+  const signatures = [
+    "yt-dlp",
+    "youtube-dl",
+    "ffmpeg",
+    "libav",
+    "wget",
+    "curl/",
+    "aria2",
+    "httpie",
+    "python-requests",
+    "go-http-client",
+    "okhttp",
+  ];
+
+  return signatures.some((signature) => normalized.includes(signature));
 }
 
 function parseOriginCandidate(originValue) {
@@ -239,6 +311,9 @@ function validateRequestContext(request, env) {
     return { ok: true };
   }
 
+  const requireOrigin = getRequireOrigin(env);
+  const requireSecFetch = getRequireSecFetch(env);
+
   const allowedOriginRules = getAllowedOriginRules(env);
   if (allowedOriginRules.length === 0) {
     return {
@@ -250,8 +325,14 @@ function validateRequestContext(request, env) {
   const origin = request.headers.get("Origin");
   const referer = request.headers.get("Referer");
   const secFetchSite = request.headers.get("Sec-Fetch-Site");
+  const secFetchMode = request.headers.get("Sec-Fetch-Mode");
+  const secFetchDest = request.headers.get("Sec-Fetch-Dest");
 
-  if (!origin && !referer && !secFetchSite) {
+  if (requireOrigin && !origin) {
+    return { ok: false, reason: "origin_missing" };
+  }
+
+  if (!requireOrigin && !origin && !referer && !secFetchSite) {
     return { ok: false, reason: "missing_browser_context_headers" };
   }
 
@@ -269,8 +350,32 @@ function validateRequestContext(request, env) {
     }
   }
 
-  if (secFetchSite && !["same-origin", "same-site", "cross-site", "none"].includes(secFetchSite)) {
-    return { ok: false, reason: "invalid_sec_fetch_site" };
+  const allowedSecFetchSite = ["same-origin", "same-site", "cross-site", "none"];
+  const allowedSecFetchMode = ["cors", "no-cors", "same-origin", "navigate"];
+  const allowedSecFetchDest = [
+    "",
+    "empty",
+    "video",
+    "audio",
+    "document",
+    "iframe",
+    "embed",
+  ];
+
+  if (requireSecFetch && (!secFetchSite || !secFetchMode)) {
+    return { ok: false, reason: "sec_fetch_missing" };
+  }
+
+  if (secFetchSite && !allowedSecFetchSite.includes(secFetchSite)) {
+    return { ok: false, reason: "sec_fetch_site_invalid" };
+  }
+
+  if (secFetchMode && !allowedSecFetchMode.includes(secFetchMode)) {
+    return { ok: false, reason: "sec_fetch_mode_invalid" };
+  }
+
+  if (secFetchDest && !allowedSecFetchDest.includes(secFetchDest)) {
+    return { ok: false, reason: "sec_fetch_dest_invalid" };
   }
 
   return { ok: true };
@@ -321,16 +426,43 @@ function getAbuseBlockTtlSeconds(env) {
 }
 
 function getSessionValidationCacheTtlSeconds(env) {
-  const parsed = parsePositiveInt(
+  return parsePositiveInt(
     env.VIDEO_GATE_SESSION_VALIDATION_CACHE_TTL_SECONDS,
     DEFAULT_SESSION_VALIDATION_CACHE_TTL_SECONDS,
   );
+}
 
-  if (env.VIDEO_GATE_KV) {
-    return Math.max(60, parsed);
+function getSessionValidationCacheMaxForHeartbeatSeconds(env) {
+  return parsePositiveInt(
+    env.VIDEO_GATE_SESSION_VALIDATION_CACHE_MAX_FOR_HEARTBEAT_SECONDS,
+    DEFAULT_SESSION_VALIDATION_CACHE_MAX_FOR_HEARTBEAT_SECONDS,
+  );
+}
+
+function getSessionValidationCacheTtlForPayload(env, tokenPayload) {
+  const baseTtlSeconds = getSessionValidationCacheTtlSeconds(env);
+  if (tokenPayload?.hbr === true) {
+    const heartbeatCapSeconds = getSessionValidationCacheMaxForHeartbeatSeconds(env);
+    return Math.max(1, Math.min(baseTtlSeconds, heartbeatCapSeconds));
   }
 
-  return parsed;
+  if (env.VIDEO_GATE_KV) {
+    return Math.max(60, baseTtlSeconds);
+  }
+
+  return baseTtlSeconds;
+}
+
+function shouldUseKvSessionValidationCache(env, tokenPayload, cacheTtlSeconds) {
+  if (!env.VIDEO_GATE_KV) {
+    return false;
+  }
+
+  if (tokenPayload?.hbr !== true) {
+    return true;
+  }
+
+  return cacheTtlSeconds >= 60;
 }
 
 function sessionValidationCacheKey(tokenPayload) {
@@ -551,6 +683,105 @@ function getClientIpPrefix(request) {
   return extractIpPrefix(getClientIp(request));
 }
 
+async function getSessionStickyIp(env, sessionId) {
+  const key = `ip:sticky:session:${sessionId}`;
+  const now = Date.now();
+
+  if (env.VIDEO_GATE_KV) {
+    return (await env.VIDEO_GATE_KV.get(key)) || undefined;
+  }
+
+  const cached = inMemorySessionIpStickyWindow.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    return undefined;
+  }
+  return cached.ipPrefix;
+}
+
+async function setSessionStickyIp(env, sessionId, ipPrefix, ttlSeconds) {
+  const key = `ip:sticky:session:${sessionId}`;
+  const now = Date.now();
+  const expiresAt = now + ttlSeconds * 1000;
+
+  if (env.VIDEO_GATE_KV) {
+    await env.VIDEO_GATE_KV.put(key, ipPrefix, {
+      expirationTtl: Math.max(60, ttlSeconds),
+    });
+    return;
+  }
+
+  inMemorySessionIpStickyWindow.set(key, { ipPrefix, expiresAt });
+}
+
+async function getSessionIpGraceSeen(env, sessionId) {
+  const key = `ip:sticky:grace:${sessionId}`;
+  const now = Date.now();
+
+  if (env.VIDEO_GATE_KV) {
+    const value = await env.VIDEO_GATE_KV.get(key);
+    return value === "1";
+  }
+
+  const cached = inMemorySessionIpGraceWindow.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    return false;
+  }
+  return cached.seen === true;
+}
+
+async function setSessionIpGraceSeen(env, sessionId, ttlSeconds) {
+  const key = `ip:sticky:grace:${sessionId}`;
+  const now = Date.now();
+  const expiresAt = now + ttlSeconds * 1000;
+
+  if (env.VIDEO_GATE_KV) {
+    await env.VIDEO_GATE_KV.put(key, "1", {
+      expirationTtl: Math.max(60, ttlSeconds),
+    });
+    return;
+  }
+
+  inMemorySessionIpGraceWindow.set(key, { seen: true, expiresAt });
+}
+
+async function enforceSessionIpStickiness(env, tokenPayload, clientIpPrefix) {
+  if (!getSessionIpStickyEnabled(env)) {
+    return { ok: true };
+  }
+
+  if (!clientIpPrefix || !tokenPayload?.sid) {
+    return { ok: true };
+  }
+
+  const stickyTtlSeconds = getSessionIpStickyTtlSeconds(env);
+  const expectedIpPrefix = await getSessionStickyIp(env, tokenPayload.sid);
+  if (!expectedIpPrefix) {
+    await setSessionStickyIp(env, tokenPayload.sid, clientIpPrefix, stickyTtlSeconds);
+    return { ok: true };
+  }
+
+  if (expectedIpPrefix === clientIpPrefix) {
+    await setSessionStickyIp(env, tokenPayload.sid, clientIpPrefix, stickyTtlSeconds);
+    return { ok: true };
+  }
+
+  if (!getSessionIpStickyGraceEnabled(env)) {
+    return { ok: false, reason: "session_ip_drift" };
+  }
+
+  const graceSeen = await getSessionIpGraceSeen(env, tokenPayload.sid);
+  if (!graceSeen) {
+    await setSessionIpGraceSeen(
+      env,
+      tokenPayload.sid,
+      getSessionIpStickyGraceSeconds(env),
+    );
+    return { ok: true, drifted: true };
+  }
+
+  return { ok: false, reason: "session_ip_drift" };
+}
+
 async function validateSessionWithControlPlane(env, tokenPayload, requestId) {
   const validationUrl = resolveControlPlaneEndpoint(
     env,
@@ -567,10 +798,15 @@ async function validateSessionWithControlPlane(env, tokenPayload, requestId) {
   }
 
   const now = Date.now();
-  const cacheTtlSeconds = getSessionValidationCacheTtlSeconds(env);
+  const cacheTtlSeconds = getSessionValidationCacheTtlForPayload(env, tokenPayload);
+  const useKvCache = shouldUseKvSessionValidationCache(
+    env,
+    tokenPayload,
+    cacheTtlSeconds,
+  );
   const cacheKey = sessionValidationCacheKey(tokenPayload);
 
-  if (env.VIDEO_GATE_KV) {
+  if (useKvCache) {
     const raw = await env.VIDEO_GATE_KV.get(cacheKey);
     if (raw) {
       try {
@@ -637,7 +873,7 @@ async function validateSessionWithControlPlane(env, tokenPayload, requestId) {
   }
 
   const expiresAt = now + cacheTtlSeconds * 1000;
-  if (env.VIDEO_GATE_KV) {
+  if (useKvCache) {
     await env.VIDEO_GATE_KV.put(
       cacheKey,
       JSON.stringify({ ok: result, expiresAt }),
@@ -698,6 +934,8 @@ export function __resetForTests() {
   inMemorySessionValidationWindow.clear();
   inMemoryAbuseBlockWindow.clear();
   inMemoryAbuseIpBlockWindow.clear();
+  inMemorySessionIpStickyWindow.clear();
+  inMemorySessionIpGraceWindow.clear();
   inMemorySweepCounter = 0;
   hasLoggedPlaybackEventMissingConfig = false;
 }
@@ -806,6 +1044,8 @@ function sweepInMemoryWindows(now) {
   sweepExpiredEntries(inMemorySessionValidationWindow, now);
   sweepExpiredEntries(inMemoryAbuseBlockWindow, now);
   sweepExpiredEntries(inMemoryAbuseIpBlockWindow, now);
+  sweepExpiredEntries(inMemorySessionIpStickyWindow, now);
+  sweepExpiredEntries(inMemorySessionIpGraceWindow, now);
 }
 
 async function blockSessionForAbuse(env, sessionId, ttlSeconds) {
@@ -905,6 +1145,26 @@ async function authorizeRequest(
     return { ok: false, status: 401, message: "Expired token" };
   }
 
+  if (getBlockKnownDownloaderUa(env)) {
+    const userAgent = request.headers.get("user-agent") || "";
+    if (isKnownDownloaderUserAgent(userAgent)) {
+      console.warn(
+        "gate_known_downloader_ua_blocked",
+        JSON.stringify({
+          requestId,
+          sid: parsed.payload?.sid,
+          ua: userAgent,
+        }),
+      );
+      return {
+        ok: false,
+        status: 403,
+        message: "Blocked by playback policy",
+        detail: "known_downloader_ua",
+      };
+    }
+  }
+
   if (
     typeof parsed.payload?.sid !== "string" ||
     parsed.payload.sid.length === 0
@@ -939,13 +1199,65 @@ async function authorizeRequest(
     return { ok: false, status: 401, message: "IP prefix mismatch" };
   }
 
+  const stickyResult = await enforceSessionIpStickiness(env, parsed.payload, ipPrefix);
+  if (!stickyResult.ok) {
+    if (getAbuseAutoBlockEnabled(env)) {
+      await blockSessionForAbuse(
+        env,
+        parsed.payload.sid,
+        getAbuseBlockTtlSeconds(env),
+      );
+      if (getAbuseIpBlockEnabled(env)) {
+        await blockIpPrefixForAbuse(
+          env,
+          ipPrefix,
+          getAbuseBlockTtlSeconds(env),
+        );
+      }
+    }
+    return {
+      ok: false,
+      status: 403,
+      message: "Session IP drift blocked",
+      detail: stickyResult.reason,
+      tokenPayload: parsed.payload,
+    };
+  }
+
+  if (getRequireHeartbeat(env) && parsed.payload?.hbr === true) {
+    const heartbeatAt = parsed.payload?.hb;
+    if (typeof heartbeatAt !== "number") {
+      return {
+        ok: false,
+        status: 401,
+        message: "Missing heartbeat claim",
+        detail: "heartbeat_missing",
+      };
+    }
+
+    const heartbeatMaxAgeMs = getHeartbeatMaxAgeSeconds(env) * 1000;
+    if (now - heartbeatAt > heartbeatMaxAgeMs) {
+      return {
+        ok: false,
+        status: 401,
+        message: "Heartbeat stale",
+        detail: "heartbeat_stale",
+      };
+    }
+  }
+
   const sessionValid = await validateSessionWithControlPlane(
     env,
     parsed.payload,
     requestId,
   );
   if (!sessionValid) {
-    return { ok: false, status: 401, message: "Session validation failed" };
+    return {
+      ok: false,
+      status: 401,
+      message: "Session validation failed",
+      detail: "session_validation_failed",
+    };
   }
 
   return { ok: true, tokenPayload: parsed.payload, token };
@@ -1012,7 +1324,13 @@ async function handleMasterManifest(request, env, executionCtx, assetId, request
 
   const rateConfig = getRateConfig(env);
   const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
-  if (!auth.ok) return json({ error: auth.message }, auth.status);
+  if (!auth.ok) {
+    return json(
+      { error: auth.message, detail: auth.detail },
+      auth.status,
+      { "Cache-Control": "no-store" },
+    );
+  }
 
   const allowed = await enforceRateLimit(
     env,
@@ -1081,7 +1399,13 @@ async function handleRenditionManifest(
 
   const rateConfig = getRateConfig(env);
   const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
-  if (!auth.ok) return json({ error: auth.message }, auth.status);
+  if (!auth.ok) {
+    return json(
+      { error: auth.message, detail: auth.detail },
+      auth.status,
+      { "Cache-Control": "no-store" },
+    );
+  }
 
   const allowed = await enforceRateLimit(
     env,
@@ -1154,7 +1478,13 @@ async function handleSegment(
 
   const rateConfig = getRateConfig(env);
   const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
-  if (!auth.ok) return json({ error: auth.message }, auth.status);
+  if (!auth.ok) {
+    return json(
+      { error: auth.message, detail: auth.detail },
+      auth.status,
+      { "Cache-Control": "no-store" },
+    );
+  }
 
   const allowed = await enforceRateLimit(
     env,
@@ -1209,7 +1539,13 @@ async function handleKeyRequest(request, env, executionCtx, assetId, requestId) 
   const ipPrefix = getClientIpPrefix(request);
   const rateConfig = getRateConfig(env);
   const auth = await authorizeRequest(request, env, assetId, undefined, requestId);
-  if (!auth.ok) return json({ error: auth.message }, auth.status);
+  if (!auth.ok) {
+    return json(
+      { error: auth.message, detail: auth.detail },
+      auth.status,
+      { "Cache-Control": "no-store" },
+    );
+  }
 
   const allowed = await enforceRateLimit(
     env,
