@@ -1,0 +1,36 @@
+# ============================================
+# Core security secrets
+# ============================================
+VIDEO_PLAYBACK_TOKEN_SECRET=
+VIDEO_GATE_VALIDATION_SECRET=
+VIDEO_KEY_ENCRYPTION_SECRET=
+
+# ============================================
+# Main app endpoints
+# ============================================
+CONTROL_PLANE_BASE_URL=
+# Optional explicit overrides (normally derived from CONTROL_PLANE_BASE_URL):
+# VIDEO_GATE_VALIDATION_URL=
+# VIDEO_GATE_KEY_URL=
+# VIDEO_GATE_EVENT_URL=
+
+# ============================================
+# Operations
+# ============================================
+VIDEO_GATE_MAINTENANCE_MODE=false
+
+# ============================================
+# Rate limits / replay
+# ============================================
+VIDEO_GATE_MANIFEST_PER_MINUTE=60
+VIDEO_GATE_PLAYLIST_PER_MINUTE=120
+VIDEO_GATE_SEGMENT_PER_MINUTE=1600
+VIDEO_GATE_KEY_PER_MINUTE=30
+VIDEO_GATE_KEY_REPLAY_TTL_SECONDS=900
+VIDEO_GATE_KEY_JTI_MAX_REUSE=20
+
+# ============================================
+# Request context hardening (optional)
+# ============================================
+VIDEO_GATE_STRICT_REQUEST_CONTEXT=false
+VIDEO_GATE_ALLOWED_ORIGINS=
