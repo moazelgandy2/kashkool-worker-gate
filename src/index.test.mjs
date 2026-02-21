@@ -304,3 +304,61 @@ test("sanitizes BOM-prefixed control-plane URLs", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("enforces token expiry even when control-plane validation is enabled", async () => {
+  const payload = {
+    sid: "session_expired",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() - 1_000,
+    v: 1,
+    jti: "expired_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const env = createEnv({
+      VIDEO_GATE_VALIDATION_URL: "https://main.local/video-playback-validate",
+    });
+    const response = await worker.fetch(
+      new Request(`https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`),
+      env,
+    );
+    assert.equal(response.status, 401);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects token without required session scope", async () => {
+  const payload = {
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "no_sid_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv();
+  const response = await worker.fetch(
+    new Request(`https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`),
+    env,
+  );
+  assert.equal(response.status, 401);
+});

@@ -2,6 +2,8 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 const inMemoryRateWindow = new Map();
 const inMemoryJtiWindow = new Map();
+const SWEEP_INTERVAL = 250;
+let inMemorySweepCounter = 0;
 
 const DEFAULT_RATE_CONFIG = {
   manifestPerMinute: 60,
@@ -348,11 +350,13 @@ async function incrementRateCounter(env, scope, sessionId, windowSeconds) {
   const current = inMemoryRateWindow.get(key);
   if (!current || current.expiresAt <= now) {
     inMemoryRateWindow.set(key, { count: 1, expiresAt });
+    sweepInMemoryWindows(now);
     return 1;
   }
 
   current.count += 1;
   inMemoryRateWindow.set(key, current);
+  sweepInMemoryWindows(now);
   return current.count;
 }
 
@@ -385,11 +389,31 @@ async function rememberJti(env, sessionId, jti, windowSeconds) {
   if (existing && existing.expiresAt > now) {
     existing.count += 1;
     inMemoryJtiWindow.set(key, existing);
+    sweepInMemoryWindows(now);
     return existing.count;
   }
 
   inMemoryJtiWindow.set(key, { expiresAt, count: 1 });
+  sweepInMemoryWindows(now);
   return 1;
+}
+
+function sweepExpiredEntries(windowMap, now) {
+  for (const [key, value] of windowMap) {
+    if (!value || typeof value.expiresAt !== "number" || value.expiresAt <= now) {
+      windowMap.delete(key);
+    }
+  }
+}
+
+function sweepInMemoryWindows(now) {
+  inMemorySweepCounter += 1;
+  if (inMemorySweepCounter % SWEEP_INTERVAL !== 0) {
+    return;
+  }
+
+  sweepExpiredEntries(inMemoryRateWindow, now);
+  sweepExpiredEntries(inMemoryJtiWindow, now);
 }
 
 async function authorizeRequest(request, env, expectedAssetId, expectedSessionId) {
@@ -411,18 +435,13 @@ async function authorizeRequest(request, env, expectedAssetId, expectedSessionId
     return { ok: false, status: 401, message: "Invalid token signature" };
   }
 
-  const hasControlPlaneValidation =
-    !!resolveControlPlaneEndpoint(
-      env,
-      "VIDEO_GATE_VALIDATION_URL",
-      "/video-playback-validate",
-    ) && !!env.VIDEO_GATE_VALIDATION_SECRET;
+  const now = Date.now();
+  if (typeof parsed.payload?.exp !== "number" || parsed.payload.exp <= now) {
+    return { ok: false, status: 401, message: "Expired token" };
+  }
 
-  if (!hasControlPlaneValidation) {
-    const now = Date.now();
-    if (typeof parsed.payload?.exp !== "number" || parsed.payload.exp <= now) {
-      return { ok: false, status: 401, message: "Expired token" };
-    }
+  if (typeof parsed.payload?.sid !== "string" || parsed.payload.sid.length === 0) {
+    return { ok: false, status: 401, message: "Missing token session scope" };
   }
 
   if (parsed.payload.assetId !== expectedAssetId) {
