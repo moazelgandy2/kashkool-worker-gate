@@ -1,0 +1,11 @@
+name = "kashkool-video-gate"
+main = "src/index.mjs"
+compatibility_date = "2026-02-20"
+
+[[r2_buckets]]
+binding = "VIDEO_DELIVERY_BUCKET"
+bucket_name = "kashkool-delivery"
+
+[[kv_namespaces]]
+binding = "VIDEO_GATE_KV"
+id = "7e56e93e78f64a43b99e862fc9678a6e"
