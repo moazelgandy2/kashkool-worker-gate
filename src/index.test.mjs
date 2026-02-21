@@ -140,6 +140,153 @@ test("strict request context allows cross-site when origin is allowlisted", asyn
   }
 });
 
+test("strict request context allows one-level wildcard subdomain", async () => {
+  const payload = {
+    sid: "session_strict_context_wildcard",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "strict_context_wildcard_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://kashkool.online,https://*.kashkool.online",
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const request = new Request(
+      `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+      {
+        headers: {
+          Origin: "https://moaz.kashkool.online",
+          Referer: "https://moaz.kashkool.online/watch",
+          "Sec-Fetch-Site": "cross-site",
+        },
+      },
+    );
+
+    const response = await worker.fetch(request, env);
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("strict request context blocks nested wildcard subdomains", async () => {
+  const payload = {
+    sid: "session_strict_context_nested",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "strict_context_nested_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://kashkool.online,https://*.kashkool.online",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        Origin: "https://a.b.kashkool.online",
+        Referer: "https://a.b.kashkool.online/watch",
+        "Sec-Fetch-Site": "cross-site",
+      },
+    },
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
+});
+
+test("strict request context blocks suffix lookalike domains", async () => {
+  const payload = {
+    sid: "session_strict_context_suffix",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "strict_context_suffix_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://kashkool.online,https://*.kashkool.online",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        Origin: "https://kashkool.online.evil.com",
+        Referer: "https://kashkool.online.evil.com/watch",
+        "Sec-Fetch-Site": "cross-site",
+      },
+    },
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
+});
+
+test("strict request context blocks protocol mismatch for wildcard", async () => {
+  const payload = {
+    sid: "session_strict_context_protocol",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "strict_context_protocol_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const env = createEnv({
+    VIDEO_GATE_STRICT_REQUEST_CONTEXT: "true",
+    VIDEO_GATE_ALLOWED_ORIGINS: "https://kashkool.online,https://*.kashkool.online",
+  });
+
+  const request = new Request(
+    `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        Origin: "http://moaz.kashkool.online",
+        Referer: "http://moaz.kashkool.online/watch",
+        "Sec-Fetch-Site": "cross-site",
+      },
+    },
+  );
+
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 403);
+});
+
 test("strict request context blocks cross-site when referer is not allowlisted", async () => {
   const payload = {
     sid: "session_strict_context_blocked",
@@ -575,6 +722,49 @@ test("adds CORS header for allowed origins", async () => {
   try {
     const origin = "https://app.local";
     const env = createEnv({ VIDEO_GATE_ALLOWED_ORIGINS: origin });
+    const response = await worker.fetch(
+      new Request(
+        `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,
+        { headers: { Origin: origin } },
+      ),
+      env,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Access-Control-Allow-Origin"), origin);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("adds CORS header for wildcard-allowed origin", async () => {
+  const payload = {
+    sid: "session_cors_wildcard",
+    uid: "user_1",
+    oid: "org_1",
+    lessonId: "lesson_1",
+    assetId: "asset_1",
+    exp: Date.now() + 60_000,
+    v: 1,
+    jti: "cors_wildcard_jti",
+  };
+
+  const token = makeToken(payload, "token_secret");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/video-playback-validate")) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  try {
+    const origin = "https://moaz.kashkool.online";
+    const env = createEnv({
+      VIDEO_GATE_ALLOWED_ORIGINS: "https://kashkool.online,https://*.kashkool.online",
+    });
     const response = await worker.fetch(
       new Request(
         `https://gate.local/v/asset_1/master.m3u8?token=${encodeURIComponent(token)}`,

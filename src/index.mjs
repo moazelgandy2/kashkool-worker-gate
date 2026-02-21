@@ -37,11 +37,106 @@ function getAllowedOrigins(env) {
     .filter((item) => item.length > 0);
 }
 
+function parseAllowedOriginRule(originValue) {
+  let parsed;
+  try {
+    parsed = new URL(originValue);
+  } catch {
+    return null;
+  }
+
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol !== "https:" && protocol !== "http:") {
+    return null;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  const port = parsed.port || "";
+  const isWildcard = hostname.startsWith("*.");
+
+  if (!isWildcard) {
+    return {
+      type: "exact",
+      protocol,
+      hostname,
+      port,
+    };
+  }
+
+  const baseHostname = hostname.slice(2);
+  if (!baseHostname || baseHostname.includes("*")) {
+    return null;
+  }
+
+  const baseLabels = baseHostname.split(".").filter(Boolean);
+  if (baseLabels.length < 2) {
+    return null;
+  }
+
+  return {
+    type: "wildcard_single",
+    protocol,
+    baseHostname,
+    port,
+  };
+}
+
+function getAllowedOriginRules(env) {
+  return getAllowedOrigins(env)
+    .map(parseAllowedOriginRule)
+    .filter(Boolean);
+}
+
+function parseOriginCandidate(originValue) {
+  try {
+    const parsed = new URL(originValue);
+    return {
+      protocol: parsed.protocol.toLowerCase(),
+      hostname: parsed.hostname.toLowerCase(),
+      port: parsed.port || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function matchesAllowedOrigin(originValue, rules) {
+  const candidate = parseOriginCandidate(originValue);
+  if (!candidate) return false;
+
+  for (const rule of rules) {
+    if (rule.protocol !== candidate.protocol || rule.port !== candidate.port) {
+      continue;
+    }
+
+    if (rule.type === "exact") {
+      if (rule.hostname === candidate.hostname) {
+        return true;
+      }
+      continue;
+    }
+
+    const suffix = `.${rule.baseHostname}`;
+    if (!candidate.hostname.endsWith(suffix)) {
+      continue;
+    }
+
+    const prefix = candidate.hostname.slice(0, -suffix.length);
+    if (!prefix || prefix.includes(".")) {
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
 function getCorsAllowOrigin(request, env) {
-  const allowedOrigins = getAllowedOrigins(env);
+  const allowedOriginRules = getAllowedOriginRules(env);
   const origin = request.headers.get("Origin");
   if (!origin) return null;
-  if (!allowedOrigins.includes(origin)) return null;
+  if (!matchesAllowedOrigin(origin, allowedOriginRules)) return null;
   return origin;
 }
 
@@ -130,11 +225,11 @@ function validateRequestContext(request, env) {
     return { ok: true };
   }
 
-  const allowedOrigins = getAllowedOrigins(env);
-  if (allowedOrigins.length === 0) {
+  const allowedOriginRules = getAllowedOriginRules(env);
+  if (allowedOriginRules.length === 0) {
     return {
       ok: false,
-      reason: "Strict request context enabled without allowed origins",
+      reason: "strict_context_no_allowed_origins",
     };
   }
 
@@ -146,18 +241,18 @@ function validateRequestContext(request, env) {
     return { ok: false, reason: "missing_browser_context_headers" };
   }
 
-  if (origin && !allowedOrigins.includes(origin)) {
+  if (origin && !matchesAllowedOrigin(origin, allowedOriginRules)) {
     return { ok: false, reason: "origin_not_allowed" };
   }
 
-  if (
-    referer &&
-    !allowedOrigins.some(
-      (allowedOrigin) =>
-        referer.startsWith(`${allowedOrigin}/`) || referer === allowedOrigin,
-    )
-  ) {
-    return { ok: false, reason: "referer_not_allowed" };
+  if (referer) {
+    const refererCandidate = parseOriginCandidate(referer);
+    if (
+      !refererCandidate ||
+      !matchesAllowedOrigin(referer, allowedOriginRules)
+    ) {
+      return { ok: false, reason: "referer_not_allowed" };
+    }
   }
 
   if (secFetchSite && !["same-origin", "same-site", "cross-site", "none"].includes(secFetchSite)) {
